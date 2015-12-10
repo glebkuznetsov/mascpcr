@@ -27,6 +27,7 @@ NOTE: Work in progress. Not exposed via CLI yet.
 """
 
 import copy
+from itertools import cycle
 import tempfile
 
 from Bio import SeqIO
@@ -51,7 +52,20 @@ OUTPUT_COLUMNS_ORDERED = [
     'P_WT', 'P_WT_TM', 'P_WT_SCORE',
     'P_MUT', 'P_MUT_TM', 'P_MUT_SCORE',
     'P_COMMON', 'P_COMMON_TM', 'P_COMMON_SCORE',
-    'AMPLICON_SIZE']
+    'AMPLICON_SIZE', 'P_FWD_STRAND']
+
+# Defaults optimized for MASC-PCR according to Marc J. Lajoie.
+THERMO_PARAMS = {
+    'mv_conc': 50,
+    'dv_conc': 1.5,
+    'dntp_conc': 0.4,
+    'dna_conc': 250,
+}
+
+SPURIOUS_TM_CLIP = 50
+
+# More pressure on hitting the right value.
+TM_RANGE = (61, 63)
 
 
 def find_masc_pcr_primers_given_variants(
@@ -145,6 +159,9 @@ def find_masc_pcr_primers_given_variants(
     primer_finder_params = copy.deepcopy(DEFAULT_PARAMS)
     primer_finder_params.update({
         'min_num_mismatches': 1,
+        'thermo_params': THERMO_PARAMS,
+        'spurious_tm_clip': SPURIOUS_TM_CLIP,
+        'tm_range': TM_RANGE
     })
 
     # We'll store the results as a map from variant position to discriminatory
@@ -198,7 +215,7 @@ def find_masc_pcr_primers_given_variants(
 
     # For varying amplicon sizes, we just step through them in the order in
     # which the input is provided.
-    amplicon_size_iter = iter(PRODUCT_SIZES)
+    amplicon_size_iter = cycle(PRODUCT_SIZES)
 
     for _, v_obj in variants_df.iterrows():
         candidate_dict = variant_position_to_candidate_primer_map[
@@ -227,6 +244,7 @@ def find_masc_pcr_primers_given_variants(
             assert best_primer_set['wt'].strand == best_primer_set['mut'].strand
             assert (best_primer_set['wt'].strand !=
                     best_primer_set['common'].strand)
+            v_obj['P_FWD_STRAND'] = best_primer_set['wt'].strand
             v_obj['AMPLICON_SIZE'] = getPrimerPairProductSize(
                     best_primer_set['wt'], best_primer_set['common'])
             report_prefix_and_candidate_key_pairs = [
@@ -348,15 +366,15 @@ def _find_best_common_primer(
     best_common_primer_for_fwd_primers = findBestCommonPrimerIn3pEndRange(
         fwd_common_primer_end3p_range, -1, candidate_dict['fwd_mut'],
         from_genome_str, to_genome_str, idx_lut, edge_lut, mismatch_lut,
-        primer_finder_params)
+        primer_finder_params, amplicon_size=amplicon_size)
 
     # Reverse.
     rev_common_primer_end3p_range = _find_rev_common_primer_end3p_range(
             candidate_dict, amplicon_size, edge_lut, primer_finder_params)
     best_common_primer_for_rev_primers = findBestCommonPrimerIn3pEndRange(
-        rev_common_primer_end3p_range, 1, candidate_dict['fwd_mut'],
+        rev_common_primer_end3p_range, 1, candidate_dict['rev_mut'],
         from_genome_str, to_genome_str, idx_lut, edge_lut, mismatch_lut,
-        primer_finder_params)
+        primer_finder_params, amplicon_size=amplicon_size)
 
     # TODO: It should be okay if one of these is None, but need to explore
     # failure cases more carefully.
@@ -395,6 +413,7 @@ def _find_best_common_primer(
             best_common_primer_for_rev_primers.score +
             candidate_dict['rev_mut'].score +
             candidate_dict['rev_wt'].score)
+
     if fwd_score >= rev_score:
         return _build_fwd_result()
     else:
@@ -408,11 +427,20 @@ def _find_fwd_common_primer_end3p_range(
     # Identify the range of possible 3-prime ends for the common primer using
     # the 5-prime end of discriminatory_primer and amplicon_size.
     discriminatory_primer_end5p = candidate_dict['fwd_mut'].idx
-    common_primer_end3p_min = (discriminatory_primer_end5p +
-            amplicon_size - primer_finder_params['product_size_tolerance'])
+
+    # e.g. 0 + 100 - 30 - 10 = 60
+    common_primer_end3p_min = (
+            discriminatory_primer_end5p +
+            amplicon_size -
+            primer_finder_params['size_range'][1] -
+            primer_finder_params['product_size_tolerance'])
+
+    # e.g. 0 + 100 - 18 + 10 = 82
     common_primer_end3p_upper_bound = (
-            common_primer_end3p_min +
-            2 * primer_finder_params['product_size_tolerance'] + 1)
+            discriminatory_primer_end5p +
+            amplicon_size -
+            primer_finder_params['size_range'][0] +
+            primer_finder_params['product_size_tolerance'])
 
     # Define the search space of common primer 3-prime ends to avoid edges.
     common_primer_end3p_max = common_primer_end3p_min
@@ -422,6 +450,7 @@ def _find_fwd_common_primer_end3p_range(
             break
         else:
             common_primer_end3p_max = safe_upper_bound
+
     return range(common_primer_end3p_min, common_primer_end3p_max)
 
 
@@ -433,15 +462,27 @@ def _find_rev_common_primer_end3p_range(
     # the 5-prime end of discriminatory_primer and amplicon_size.
     discriminatory_primer_end5p = (candidate_dict['rev_mut'].idx +
             candidate_dict['rev_mut'].length)
-    common_primer_end3p_max = (discriminatory_primer_end5p - amplicon_size +
+
+    # e.g. 1000 - 100 + 30 + 10
+    common_primer_end3p_max = (
+            discriminatory_primer_end5p -
+            amplicon_size +
+            primer_finder_params['size_range'][1] +
+            primer_finder_params['product_size_tolerance'])
+
+    # e.g. 0 + 100 - 18 + 10 = 82
+    common_primer_end3p_lower_bound = (
+            discriminatory_primer_end5p -
+            amplicon_size +
+            primer_finder_params['size_range'][0] -
             primer_finder_params['product_size_tolerance'])
 
     # Define the search space of common primer 3-prime ends to avoid edges.
-    lim3p = (common_primer_end3p_max -
-            2 * primer_finder_params['product_size_tolerance'] - 1)
     min3p_no_edge = common_primer_end3p_max
-    for min3p_no_edge in range(common_primer_end3p_max - 1, lim3p, -1):
+    for min3p_no_edge in range(
+            common_primer_end3p_max - 1, common_primer_end3p_lower_bound, -1):
         if edge_lut[min3p_no_edge] != 0:
             min3p_no_edge += 1
             break
+
     return range(common_primer_end3p_max, min3p_no_edge - 1, -1)
